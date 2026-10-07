@@ -1,252 +1,586 @@
-# -* coding: utf-8 -*-
+"""Filegetter project runner: config parsing and bulk file downloads."""
+
 import configparser
+import csv
+import hashlib
 import json
 import logging
 import os
-import csv
+import re
 import time
-from timeit import default_timer as timer
-from zipfile import ZipFile, ZIP_DEFLATED
-import gzip
-from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import unquote, urlparse
+from zipfile import ZIP_DEFLATED, ZIP_STORED
+
 import requests
-import xmltodict
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-from ..common import get_dict_value, set_dict_value, update_dict_values
-from ..constants import DEFAULT_DELAY, FIELD_SPLITTER
-from ..storage import FilesystemStorage, ZipFileStorage
-try:
-    import aria2p
-except ImportError:
-    pass
+from ..common import get_dict_value, sanitize_filename
+from ..constants import (
+    DEFAULT_DELAY,
+    DEFAULT_FIELD_SPLITTER,
+    DEFAULT_RETRIES,
+    DEFAULT_TIMEOUT,
+    DEFAULT_USER_AGENT,
+    DEFAULT_WORKERS,
+    FILE_SIZE_DOWNLOAD_LIMIT,
+    PROCESSED_FIELDS,
+)
+from ..storage import FileStorage, FilesystemStorage, ZipFileStorage
 
-DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:101.0) Gecko/20100101 Firefox/101.0"
-FILE_SIZE_DOWNLOAD_LIMIT = 270000000
-DEFAULT_TIMEOUT = 10
-PARAM_SPLITTER = ';'
+logger = logging.getLogger(__name__)
 
-def load_file_list(filename, encoding='utf8'):
-    """Reads file and returns list of strings as list"""
-    flist = []
-    with open(filename, 'r', encoding=encoding) as f:
-        for l in f:
-            flist.append(l.rstrip())
-    return flist
+SOURCE_TYPES = ("csv", "jsonl", "list")
+FETCH_MODES = ("prefix", "pattern")
+STORAGE_MODES = ("filepath", "id")
+FILE_STORAGE_TYPES = ("zip", "filesystem")
 
-def load_csv_data(filename, key, encoding='utf8', delimiter=';'):
-    """Reads CSV file and returns list records as array of dicts"""
-    flist = {}
-    with open(filename, 'r', encoding=encoding) as f:
+_CD_FILENAME_STAR_RE = re.compile(r"filename\*\s*=\s*(?:utf-8|UTF-8)''([^;]+)", re.IGNORECASE)
+_CD_FILENAME_RE = re.compile(r'filename\s*=\s*"?([^";]+)"?', re.IGNORECASE)
+
+
+class ConfigError(Exception):
+    """Raised when filegetter.cfg is missing, incomplete or invalid."""
+
+
+def load_file_list(filename: str, encoding: str = "utf-8") -> List[str]:
+    """Read a text file and return its non-empty lines."""
+    with open(filename, "r", encoding=encoding) as f:
+        return [line.rstrip() for line in f]
+
+
+def load_csv_data(
+    filename: str,
+    key: str,
+    encoding: str = "utf-8",
+    delimiter: str = ",",
+) -> Dict[str, Dict[str, str]]:
+    """Read a CSV file into a dict keyed by the given column."""
+    result: Dict[str, Dict[str, str]] = {}
+    with open(filename, "r", encoding=encoding) as f:
         reader = csv.DictReader(f, delimiter=delimiter)
-        for r in reader:
-            flist[r[key]] = r
-    return flist
+        if reader.fieldnames is None or key not in reader.fieldnames:
+            raise ValueError(
+                "Column '%s' not found in %s (columns: %s)" % (key, filename, reader.fieldnames)
+            )
+        for row in reader:
+            if row.get(key):
+                result[row[key]] = row
+    return result
 
-def load_processed_files_list(filename, encoding='utf8', delimiter=','):
-    """Reads file with list of processed files"""
-    return load_csv_data(filename, 'url', encoding='utf8', delimiter=',')
+
+def load_processed_files_list(filename: str, encoding: str = "utf-8") -> Dict[str, Dict[str, str]]:
+    """Read processed.csv into a dict keyed by URL."""
+    return load_csv_data(filename, "url", encoding=encoding)
 
 
-def _url_replacer(url, params, query_mode=False):
-    """Replaces urp params"""
-    if query_mode:
-        query_char = '?'
-        splitter = '&'
-    else:
-        splitter = PARAM_SPLITTER
-        query_char = PARAM_SPLITTER
-    parsed = urlparse(url)
-    finalparams = []
-    for k, v in params.items():
-        finalparams.append('%s=%s' % (str(k), str(v)))
-    return parsed.geturl() + query_char + splitter.join(finalparams)
+def parse_content_disposition(value: str) -> Optional[str]:
+    """Extract a filename from a Content-Disposition header value."""
+    match = _CD_FILENAME_STAR_RE.search(value)
+    if match:
+        return unquote(match.group(1).strip())
+    match = _CD_FILENAME_RE.search(value)
+    if match:
+        return match.group(1).strip().strip('"')
+    return None
 
+
+def build_url(root_url: str, uniq_id: str, fetch_mode: str) -> str:
+    """Build the download URL for a source identifier."""
+    uid = str(uniq_id).strip()
+    if fetch_mode == "pattern":
+        return root_url.format(uid)
+    if uid.startswith(("http://", "https://")):
+        return uid
+    if not root_url:
+        return uid
+    return root_url.rstrip("/") + "/" + uid.lstrip("/")
 
 
 class FilegetterBuilder:
-    """Filegetter project builder"""
+    """Reads a filegetter project config and downloads the listed files."""
 
-    def __init__(self, project_path=None):
-        self.http = requests.Session()
+    def __init__(self, project_path: Optional[str] = None):
         self.project_path = os.getcwd() if project_path is None else project_path
-        self.config_filename = os.path.join(self.project_path, 'filegetter.cfg')
-        self.__read_config(self.config_filename)
-        pass
+        self.config_filename = os.path.join(self.project_path, "filegetter.cfg")
+        self._read_config(self.config_filename)
+        self.http = self._build_session()
 
-    def __read_config(self, filename):
-        self.config = None
-        if os.path.exists(self.config_filename):
-            conf = configparser.ConfigParser()
-            conf.read(filename, encoding='utf8')
-            self.config = conf
+    # ------------------------------------------------------------------
+    # Configuration
 
-            self.id = conf.get('project', 'id') if conf.has_option('settings', 'id') else None
-            self.name = conf.get('project', 'name')
-            self.data_key = conf.get('data', 'data_key') if conf.has_option('data', 'data_key') else None
-            self.source = conf.get('project', 'source')
-            self.source_type = conf.get('project', 'source_type')
-            self.field_splitter = conf.get('project', 'splitter') if conf.has_option('settings',
-                                                                                      'splitter') else FIELD_SPLITTER
-            self.delimiter = conf.get('project', 'delimiter') if conf.has_option('project', 'delimiter') else ','
-            self.delimiter = '\t' if self.delimiter == 'tab' else ','
-
-            storagedir = conf.get('storage', 'storage_path') if conf.has_option('storage',
-                                                                                   'storage_path') else 'storage'
-            self.storagedir = os.path.join(self.project_path, storagedir)
-            self.storage_type = conf.get('storage', 'storage_type')
-
-            if conf.has_section('files'):
-                self.fetch_mode = conf.get('files', 'fetch_mode')
-                self.transfer_ext = conf.get('files', 'transfer_ext') if conf.has_option('files', 'transfer_ext') else None
-                self.default_ext = conf.get('files', 'default_ext') if conf.has_option('files', 'default_ext') else None
-                self.files_keys = conf.get('files', 'keys').split(',')
-                self.root_url = conf.get('files', 'root_url')
-                self.storage_mode = conf.get('files', 'storage_mode') if conf.has_option('files', 'storage_mode') else 'filepath'
-                self.file_storage_type = conf.get('files', 'file_storage_type') if conf.has_option('files', 'file_storage_type') else 'zip'
-                self.use_aria2 = conf.get('files', 'use_aria2') if conf.has_option('files', 'use_aria2') else 'False'
-
-
-
-    def init(self, url, pagekey, pagesize, datakey, itemkey, changekey, iterateby, http_mode, work_modes):
-        """[TBD] Unfinished method. Don't use it please"""
-        conf = self.__read_config(self.config_filename)
-        if conf is None:
-            print('Config file not found. Please run in project directory')
-            return
-        pass
-
-    def run(self, be_careful=False):
-        """Downloads all files associated with this API data"""
-        headers = {'User-Agent' : DEFAULT_USER_AGENT}
-        if self.config is None:
-            print('Config file not found. Please run in project directory')
-            return
-        if not os.path.exists(self.storagedir):
-            os.mkdir(self.storagedir)
-        if self.storage_type != 'zip':
-            print('Only zip storage supported right now')
-            return
-        uniq_ids = []
-
-        allfiles_name = os.path.join(self.storagedir, 'allfiles.csv')
-        if not os.path.exists(allfiles_name):
-            if self.source_type == 'list':
-                f = open(self.source, 'r', encoding='utf8')
-                for l in f:
-                    uniq_ids.append(l)
-                f.close()
-            elif self.source_type == 'csv':
-                f = open(self.source, 'r', encoding='utf8')
-                reader = csv.DictReader(f, delimiter=self.delimiter)
-                for row in reader:
-                    if len(row[self.data_key]) > 0:
-                        uniq_ids.append(row[self.data_key])
-                f.close()
-            elif self.source_type == 'jsonl':
-                f = open(self.source, 'r', encoding='utf8')
-                for l in f:
-                    row = json.loads(l)
-                    if self.data_key:
-                        iterate_data = get_dict_value(row, self.data_key, splitter=self.field_splitter)
-                    else:
-                        iterate_data = row
-                    for item in iterate_data:
-                        if item:
-                            for key in self.files_keys:
-                                file_data = get_dict_value(item, key, as_array=True, splitter=self.field_splitter)
-                                if file_data:
-                                    for uniq_id in file_data:
-                                        if uniq_id is not None:
-                                            uniq_ids.append(uniq_id)
-                    uniq_ids.append(row[self.data_key])
-                f.close()
-
-            logging.info('Storing all filenames')
-            f = open(allfiles_name, 'w', encoding='utf8')
-            for u in uniq_ids:
-                f.write(str(u) + '\n')
-            f.close()
-        else:
-            logging.info('Load all filenames')
-            uniq_ids = load_file_list(allfiles_name)
-        # Start download
-        processed_files = {}
-        skipped_files_dict = {}
-        files_storage_file = os.path.join(self.storagedir, 'files.zip')
-        files_list_storage = os.path.join(self.storagedir, 'processed.csv')
-        w_headers = False
-        if os.path.exists(files_list_storage):
-            processed_files = load_processed_files_list(files_list_storage, encoding='utf8')
-            list_file = open(files_list_storage, 'a', encoding='utf8')
-        else:
-            list_file = open(files_list_storage, 'w', encoding='utf8')
-            fields = ['url', 'filename', 'mime', 'ext', 'disp_name',  'filesize']
-            w_headers = True
-        writer = csv.writer(list_file, delimiter=',')
-        if w_headers:
-            writer.writerow(fields)
-
-        use_aria2 = True if self.use_aria2 == 'True' else False
-        if use_aria2:
-            aria2 = aria2p.API(
-                aria2p.Client(
-                    host="http://localhost",
-                    port=6800,
-                    secret=""
-                )
+    def _read_config(self, filename: str) -> None:
+        if not os.path.exists(filename):
+            raise ConfigError(
+                "Config file not found: %s. Run in a project directory or "
+                "pass --projectpath." % filename
             )
+        conf = configparser.ConfigParser()
+        conf.read(filename, encoding="utf-8")
+        self.config = conf
+
+        errors: List[str] = []
+
+        def get(section: str, option: str, fallback: Optional[str] = None) -> Optional[str]:
+            if conf.has_option(section, option):
+                return conf.get(section, option)
+            return fallback
+
+        def get_bool(section: str, option: str, fallback: bool) -> bool:
+            if not conf.has_option(section, option):
+                return fallback
+            try:
+                return conf.getboolean(section, option)
+            except ValueError:
+                errors.append("Option [%s] %s must be True or False" % (section, option))
+                return fallback
+
+        def get_number(section: str, option: str, fallback: float, minimum: float) -> float:
+            raw = get(section, option)
+            if raw is None:
+                return fallback
+            try:
+                value = float(raw)
+            except ValueError:
+                errors.append("Option [%s] %s must be a number" % (section, option))
+                return fallback
+            if value < minimum:
+                errors.append("Option [%s] %s must be >= %s" % (section, option, minimum))
+                return fallback
+            return value
+
+        # [project]
+        name = get("project", "name") or ""
+        source_type = get("project", "source_type") or ""
+        self.field_splitter = get("project", "splitter") or DEFAULT_FIELD_SPLITTER
+        delimiter = get("project", "delimiter") or ","
+        self.delimiter = "\t" if delimiter == "tab" else delimiter
+        source = get("project", "source") or ""
+
+        # [data]
+        data_key = get("data", "data_key") or ""
+
+        # [files]
+        fetch_mode = get("files", "fetch_mode") or ""
+        root_url_raw = get("files", "root_url")
+        keys_raw = get("files", "keys")
+        files_keys = [k.strip() for k in keys_raw.split(",")] if keys_raw else []
+        storage_mode = get("files", "storage_mode") or "filepath"
+        self.default_ext = get("files", "default_ext")
+        self.transfer_ext = get_bool("files", "transfer_ext", False)
+        file_storage_type = get("files", "file_storage_type")
+        if file_storage_type is None:
+            # legacy option from [storage]
+            file_storage_type = get("storage", "storage_type") or "zip"
+        self.delay = get_number("files", "delay", DEFAULT_DELAY, 0)
+        self.retries = int(get_number("files", "retries", DEFAULT_RETRIES, 0))
+        self.timeout = get_number("files", "timeout", DEFAULT_TIMEOUT, 0)
+        self.workers = int(get_number("files", "workers", DEFAULT_WORKERS, 1))
+        self.max_filesize = int(get_number("files", "max_filesize", FILE_SIZE_DOWNLOAD_LIMIT, 1))
+        self.user_agent = get("files", "user_agent") or DEFAULT_USER_AGENT
+        self.verify_ssl = get_bool("files", "verify_ssl", True)
+
+        # [storage]
+        storagedir = get("storage", "storage_path") or "storage"
+        self.compression = get_bool("storage", "compression", True)
+
+        if (get("files", "use_aria2") or "False").lower() == "true":
+            logger.warning(
+                "Option [files] use_aria2 is ignored: aria2 support was "
+                "removed in filegetter 1.1.0 (it never recorded downloads "
+                "in processed.csv); built-in downloading is used instead"
+            )
+
+        # Validation
+        if not name:
+            errors.append("Option [project] name is required")
+        if not source:
+            errors.append("Option [project] source is required")
+        if source_type not in SOURCE_TYPES:
+            errors.append(
+                "Option [project] source_type must be one of: %s" % ", ".join(SOURCE_TYPES)
+            )
+        if source_type in ("csv", "jsonl") and not data_key:
+            errors.append("Option [data] data_key is required for source_type=%s" % source_type)
+        if not files_keys:
+            errors.append("Option [files] keys is required (comma-separated list)")
+        if fetch_mode not in FETCH_MODES:
+            errors.append("Option [files] fetch_mode must be one of: %s" % ", ".join(FETCH_MODES))
+        if fetch_mode == "pattern" and root_url_raw is not None and "{}" not in root_url_raw:
+            errors.append(
+                "Option [files] root_url must contain a '{}' placeholder " "when fetch_mode=pattern"
+            )
+        if root_url_raw is None:
+            errors.append("Option [files] root_url is required")
+        if storage_mode not in STORAGE_MODES:
+            errors.append(
+                "Option [files] storage_mode must be one of: %s" % ", ".join(STORAGE_MODES)
+            )
+        if file_storage_type not in FILE_STORAGE_TYPES:
+            errors.append(
+                "Option [files] file_storage_type must be one of: %s"
+                % ", ".join(FILE_STORAGE_TYPES)
+            )
+
+        if errors:
+            raise ConfigError("Invalid configuration:\n- " + "\n- ".join(errors))
+
+        # Resolved, non-optional attributes
+        if not os.path.isabs(source):
+            source = os.path.join(self.project_path, source)
+        if not os.path.isabs(storagedir):
+            storagedir = os.path.join(self.project_path, storagedir)
+        self.name = name
+        self.source_type = source_type
+        self.source = source
+        self.data_key = data_key
+        self.fetch_mode = fetch_mode
+        self.root_url = root_url_raw or ""
+        self.files_keys = files_keys
+        self.storage_mode = storage_mode
+        self.file_storage_type = file_storage_type
+        self.storagedir = storagedir
+
+    def _build_session(self) -> requests.Session:
+        session = requests.Session()
+        retry = Retry(
+            total=self.retries,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_maxsize=max(self.workers, 1))
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        session.headers["User-Agent"] = self.user_agent
+        return session
+
+    # ------------------------------------------------------------------
+    # Source parsing
+
+    def _load_ids(self) -> List[str]:
+        ids: List[str] = []
+        if self.source_type == "list":
+            ids = [line.strip() for line in load_file_list(self.source) if line.strip()]
+        elif self.source_type == "csv":
+            with open(self.source, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f, delimiter=self.delimiter)
+                if reader.fieldnames is None or self.data_key not in reader.fieldnames:
+                    raise ConfigError(
+                        "Column '%s' not found in %s (columns: %s)"
+                        % (self.data_key, self.source, reader.fieldnames)
+                    )
+                for row in reader:
+                    value = row.get(self.data_key)
+                    if value:
+                        ids.append(value)
+        elif self.source_type == "jsonl":
+            with open(self.source, "r", encoding="utf-8") as f:
+                for lineno, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError as e:
+                        logger.warning("Skipping malformed JSON line %d: %s", lineno, e)
+                        continue
+                    if self.data_key:
+                        records = (
+                            get_dict_value(
+                                row,
+                                self.data_key,
+                                as_array=True,
+                                splitter=self.field_splitter,
+                            )
+                            or []
+                        )
+                    else:
+                        records = [row]
+                    for record in records:
+                        for key in self.files_keys:
+                            values = (
+                                get_dict_value(
+                                    record,
+                                    key,
+                                    as_array=True,
+                                    splitter=self.field_splitter,
+                                )
+                                or []
+                            )
+                            for value in values:
+                                if value is not None and str(value).strip():
+                                    ids.append(str(value).strip())
+        # Deduplicate while preserving order
+        return list(dict.fromkeys(ids))
+
+    # ------------------------------------------------------------------
+    # Downloading
+
+    def _fetch(self, url: str, filename: str) -> Tuple[Dict[str, Any], Optional[bytes]]:
+        if self.delay > 0:
+            time.sleep(self.delay)
+        response = self.http.get(url, stream=True, timeout=self.timeout, verify=self.verify_ssl)
+        record: Dict[str, Any] = {
+            "url": url,
+            "filename": filename,
+            "mime": None,
+            "ext": None,
+            "disp_name": None,
+            "filesize": 0,
+            "status": str(response.status_code),
+            "sha256": "",
+        }
+        try:
+            record["mime"] = response.headers.get("content-type")
+            disposition = response.headers.get("content-disposition")
+            if disposition:
+                record["disp_name"] = parse_content_disposition(disposition)
+
+            if response.status_code != 200:
+                record["error"] = "HTTP %d" % response.status_code
+                return record, None
+
+            hasher = hashlib.sha256()
+            chunks: List[bytes] = []
+            size = 0
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                size += len(chunk)
+                if size > self.max_filesize:
+                    record["error"] = (
+                        "File exceeds max_filesize limit (%d bytes)" % self.max_filesize
+                    )
+                    record["status"] = "error"
+                    return record, None
+                hasher.update(chunk)
+                chunks.append(chunk)
+            record["filesize"] = size
+            record["sha256"] = hasher.hexdigest()
+            return record, b"".join(chunks)
+        finally:
+            response.close()
+
+    def _fetch_safe(self, url: str, filename: str) -> Tuple[Dict[str, Any], Optional[bytes]]:
+        try:
+            return self._fetch(url, filename)
+        except requests.RequestException as e:
+            logger.warning("Download failed: %s (%s)", url, e)
+        except Exception:  # keep the batch running on unexpected errors
+            logger.exception("Unexpected error downloading %s", url)
+        record = {
+            "url": url,
+            "filename": filename,
+            "mime": None,
+            "ext": None,
+            "disp_name": None,
+            "filesize": 0,
+            "status": "error",
+            "sha256": "",
+            "error": "connection error",
+        }
+        return record, None
+
+    def _apply_ext(self, filename: str, disp_name: Optional[str]) -> Tuple[str, Optional[str]]:
+        ext = None
+        if disp_name and "." in disp_name:
+            ext = disp_name.rsplit(".", 1)[-1].lower()
+        target = None
+        if self.transfer_ext:
+            target = ext or self.default_ext
+        elif self.default_ext:
+            target = self.default_ext
+        # Only extend names that have no extension at all
+        if target and "." not in os.path.basename(filename):
+            filename = filename + "." + target.lstrip(".").lower()
+        return filename, ext
+
+    def _filename_for(self, uniq_id: str, url: str, index: int) -> str:
+        if self.storage_mode == "filepath":
+            filename = sanitize_filename(urlparse(url).path)
+            if not filename:
+                filename = sanitize_filename(str(uniq_id))
         else:
-            aria2 = None
-        if self.file_storage_type == 'zip':
-            fstorage = ZipFileStorage(files_storage_file, mode='a', compression=ZIP_DEFLATED)
-        elif self.file_storage_type == 'filesystem':
-            fstorage = FilesystemStorage(os.path.join('storage', 'files'))
+            filename = sanitize_filename(str(uniq_id))
+        return filename or "file_%06d" % index
 
+    def _build_storage(self) -> FileStorage:
+        if self.file_storage_type == "zip":
+            compression = ZIP_DEFLATED if self.compression else ZIP_STORED
+            return ZipFileStorage(
+                os.path.join(self.storagedir, "files.zip"),
+                mode="a",
+                compression=compression,
+            )
+        return FilesystemStorage(os.path.join(self.storagedir, "files"))
 
-        n = 0
-        for uniq_id in uniq_ids:
-            if self.fetch_mode == 'prefix':
-                url = self.root_url + str(uniq_id)
-            elif self.fetch_mode == 'pattern':
-                url = self.root_url.format(uniq_id)
-            n += 1
-            if n % 50 == 0:
-                logging.info('Downloaded %d files' % (n))
-            if self.storage_mode == 'filepath':
-                filename = urlparse(url).path
+    def run(
+        self, dry_run: bool = False, limit: Optional[int] = None, refresh: bool = False
+    ) -> Dict[str, int]:
+        """Download all files listed in the project source.
+
+        Returns a stats dict with 'total', 'skipped', 'downloaded' and
+        'failed' counters ('pending' instead for dry runs).
+        """
+        if dry_run:
+            uniq_ids = self._load_ids()
+        else:
+            os.makedirs(self.storagedir, exist_ok=True)
+            allfiles_name = os.path.join(self.storagedir, "allfiles.csv")
+            if refresh or not os.path.exists(allfiles_name):
+                uniq_ids = self._load_ids()
+                logger.info("Storing %d file ids", len(uniq_ids))
+                with open(allfiles_name, "w", encoding="utf-8") as f:
+                    for uid in uniq_ids:
+                        f.write(str(uid) + "\n")
             else:
-                filename = str(uniq_id)
+                logger.info("Loading cached file ids from %s", allfiles_name)
+                uniq_ids = [u for u in load_file_list(allfiles_name) if u.strip()]
 
-            logging.info('Processing %s as %s' % (url, filename))
-#            if fstorage.exists(filename):
-            if url in processed_files.keys():
-                logging.info('File %s already stored' % (filename))
-            else:
-                if not use_aria2:
-                    response = self.http.get(url, headers=headers, timeout=DEFAULT_TIMEOUT, verify=False)
-                    if 'content-type' in response.headers.keys():
-                        mime = response.headers['content-type']
-                    else:
-                        mime = None
-                    if 'content-disposition' in response.headers.keys():
-                        disp_name = response.headers['content-disposition'].rsplit('filename=', 1)[-1].strip('"')
-                        disp_ext = disp_name.rsplit('.', 1)[-1].lower()
-                    else:
-                        disp_name = None
-                        disp_ext = None
-                    ext = disp_ext
-                    if self.transfer_ext is not None:
-                        if ext is not None:
-                            filename = filename + "." + ext
-                    elif self.default_ext is not None:
-                        filename = filename + "." + self.default_ext
-                    record = [url, filename, mime, ext, disp_name, str(len(response.content))]
-                    fstorage.store(filename, response.content)
-                    writer.writerow(map(str, record))
-                    processed_files[url] = record
+        if not uniq_ids:
+            logger.error("No file identifiers found in source %s", self.source)
+            return {"total": 0, "skipped": 0, "downloaded": 0, "failed": 0, "pending": 0}
+
+        entries = []
+        for index, uniq_id in enumerate(uniq_ids):
+            url = build_url(self.root_url, uniq_id, self.fetch_mode)
+            entries.append((uniq_id, url, self._filename_for(uniq_id, url, index)))
+
+        processed_path = os.path.join(self.storagedir, "processed.csv")
+        processed: Dict[str, Dict[str, str]] = {}
+        if os.path.exists(processed_path):
+            processed = load_processed_files_list(processed_path)
+
+        def is_done(url: str) -> bool:
+            row = processed.get(url)
+            if row is None:
+                return False
+            # rows written by <=1.0.x have no status column; treat as done
+            return row.get("status") in (None, "", "200")
+
+        pending = [e for e in entries if not is_done(e[1])]
+        stats = {
+            "total": len(entries),
+            "skipped": len(entries) - len(pending),
+        }
+
+        if limit is not None and limit >= 0:
+            pending = pending[:limit]
+
+        if dry_run:
+            logger.info("Dry run: %d of %d files would be downloaded", len(pending), len(entries))
+            for _, url, _ in pending:
+                logger.info("Would download %s", url)
+            stats["pending"] = len(pending)
+            return stats
+
+        stats["downloaded"] = 0
+        stats["failed"] = 0
+
+        list_file = self._open_processed_csv(processed_path)
+        writer = csv.writer(list_file, delimiter=",")
+        storage = self._build_storage()
+        try:
+
+            def handle(record: Dict[str, Any], content: Optional[bytes]) -> None:
+                filename = record["filename"]
+                if content is not None:
+                    filename, ext = self._apply_ext(filename, record["disp_name"])
+                    record["filename"] = filename
+                    record["ext"] = ext
+                    storage.store(filename, content)
+                    stats["downloaded"] += 1
+                    logger.info(
+                        "Stored %s (%d bytes, sha256=%s)",
+                        filename,
+                        record["filesize"],
+                        record["sha256"][:12],
+                    )
                 else:
-                    aria2.add_uris(uris=[url, ],
-                                   options={'out': filename, 'dir': os.path.abspath(os.path.join('storage', 'files'))})
+                    stats["failed"] += 1
+                    logger.warning(
+                        "Failed %s: %s", record["url"], record.get("error", record["status"])
+                    )
+                writer.writerow(
+                    [
+                        record["url"],
+                        record["filename"],
+                        record["mime"] or "",
+                        record["ext"] or "",
+                        record["disp_name"] or "",
+                        record["filesize"],
+                        record["status"],
+                        record["sha256"],
+                    ]
+                )
+                list_file.flush()
 
-        fstorage.close()
-        list_file.close()
+            done = 0
+            if self.workers > 1:
+                with ThreadPoolExecutor(max_workers=self.workers) as pool:
+                    futures = [
+                        (url, pool.submit(self._fetch_safe, url, filename))
+                        for _, url, filename in pending
+                    ]
+                    for url, future in futures:
+                        record, content = future.result()
+                        handle(record, content)
+                        done += 1
+                        if done % 50 == 0:
+                            logger.info("Processed %d/%d files", done, len(pending))
+            else:
+                for _, url, filename in pending:
+                    record, content = self._fetch_safe(url, filename)
+                    handle(record, content)
+                    done += 1
+                    if done % 50 == 0:
+                        logger.info("Processed %d/%d files", done, len(pending))
+        finally:
+            storage.close()
+            list_file.close()
+
+        logger.info(
+            "Finished: %d total, %d skipped (already downloaded), " "%d downloaded, %d failed",
+            stats["total"],
+            stats["skipped"],
+            stats["downloaded"],
+            stats["failed"],
+        )
+        return stats
+
+    def _open_processed_csv(self, path: str):
+        """Open processed.csv for appending, upgrading legacy headers."""
+        if not os.path.exists(path):
+            list_file = open(path, "w", encoding="utf-8", newline="")
+            csv.writer(list_file).writerow(PROCESSED_FIELDS)
+            return list_file
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            rows = list(csv.reader(f))
+        if not rows or rows[0] != PROCESSED_FIELDS:
+            # Upgrade a legacy 6-column report to the current format
+            records = []
+            if rows:
+                header = rows[0]
+                for row in rows[1:]:
+                    if not row:
+                        continue
+                    record = dict(zip(header, row))
+                    records.append(
+                        [
+                            record.get("url", ""),
+                            record.get("filename", ""),
+                            record.get("mime", ""),
+                            record.get("ext", ""),
+                            record.get("disp_name", ""),
+                            record.get("filesize", ""),
+                            record.get("status", ""),
+                            record.get("sha256", ""),
+                        ]
+                    )
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(PROCESSED_FIELDS)
+                writer.writerows(records)
+        return open(path, "a", encoding="utf-8", newline="")

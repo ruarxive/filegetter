@@ -1,53 +1,69 @@
-from zipfile import ZipFile, ZIP_DEFLATED
+"""Storage backends for downloaded files."""
+
 import os
+from typing import Literal, Set
+from zipfile import ZIP_DEFLATED, ZipFile
+
+from ..common import sanitize_filename
+
 
 class FileStorage:
-    """Base file storage class"""
-    def __init__(self):
-        pass
+    """Base file storage class."""
 
-    def exists(self, name):
-        raise NotImplemented
+    def exists(self, name: str) -> bool:
+        """Check if a file exists in storage."""
+        raise NotImplementedError
 
-    def store(self, filename, content):
-        raise NotImplemented
+    def store(self, filename: str, content: bytes) -> None:
+        """Store file content under the given filename."""
+        raise NotImplementedError
 
-    def close(self):
-        """Default implementation. Don't do anything"""
-        pass
+    def close(self) -> None:
+        """Release resources held by the storage."""
 
 
 class ZipFileStorage(FileStorage):
-    def __init__(self, filename, mode='a', compression=ZIP_DEFLATED):
-        FileStorage.__init__(self)
-        self.mzip = ZipFile(filename, mode=mode, compression=compression)
-        self.allfiles = self.mzip.namelist()
-        pass
+    """Store files as entries of a ZIP archive."""
 
-    def store(self, filename, content):
-        self.mzip.writestr(filename, content)
-        self.allfiles.append(filename)
+    def __init__(
+        self,
+        filename: str,
+        mode: Literal["r", "w", "x", "a"] = "a",
+        compression: int = ZIP_DEFLATED,
+    ) -> None:
+        os.makedirs(os.path.dirname(os.path.abspath(filename)), exist_ok=True)
+        self.mzip: ZipFile = ZipFile(filename, mode=mode, compression=compression)
+        self.allfiles: Set[str] = set(self.mzip.namelist())
 
-    def exists(self, filename):
-        if filename in self.allfiles:
-            return True
-        return False
+    def store(self, filename: str, content: bytes) -> None:
+        name = sanitize_filename(filename)
+        self.mzip.writestr(name, content)
+        self.allfiles.add(name)
 
-    def close(self):
+    def exists(self, filename: str) -> bool:
+        return sanitize_filename(filename) in self.allfiles
+
+    def close(self) -> None:
         self.mzip.close()
 
+
 class FilesystemStorage(FileStorage):
-    def __init__(self, dirpath=os.path.join('storage', 'files')):
-        FileStorage.__init__(self)
-        self.dirpath = dirpath
-        pass
+    """Store files in a directory tree."""
 
-    def exists(self, filename):
-        fullname = os.path.join(self.dirpath, filename)
-        return os.path.exists(fullname)
+    def __init__(self, dirpath: str) -> None:
+        self.dirpath: str = dirpath
+        os.makedirs(self.dirpath, exist_ok=True)
 
-    def store(self, filename, content):
-        fullname = os.path.join(self.dirpath, filename)
-        f = open(fullname, 'wb')
-        f.write(content)
-        f.close()
+    def _fullpath(self, filename: str) -> str:
+        # sanitize_filename guarantees a relative path, so the join can
+        # never escape dirpath.
+        return os.path.join(self.dirpath, sanitize_filename(filename))
+
+    def exists(self, filename: str) -> bool:
+        return os.path.exists(self._fullpath(filename))
+
+    def store(self, filename: str, content: bytes) -> None:
+        fullname = self._fullpath(filename)
+        os.makedirs(os.path.dirname(fullname), exist_ok=True)
+        with open(fullname, "wb") as f:
+            f.write(content)

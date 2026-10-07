@@ -1,0 +1,101 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "filegetter"
+dynamic = ["version"]
+description = "Command-line tool and Python library for automated bulk file collection from public data sources"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "Ivan Begtin", email = "ivan@begtin.tech"},
+]
+keywords = ["files", "downloader", "bulk", "collection", "automation", "archive"]
+classifiers = [
+    'Development Status :: 5 - Production/Stable',
+    'Programming Language :: Python :: 3 :: Only',
+    'Programming Language :: Python :: 3.9',
+    'Programming Language :: Python :: 3.10',
+    'Programming Language :: Python :: 3.11',
+    'Programming Language :: Python :: 3.12',
+    'Programming Language :: Python :: 3.13',
+    'Environment :: Console',
+    'Intended Audience :: Developers',
+    'Intended Audience :: System Administrators',
+    'License :: OSI Approved :: MIT License',
+    'Topic :: Software Development',
+    'Topic :: System :: Networking',
+    'Topic :: Terminals',
+    'Topic :: Text Processing',
+    'Topic :: Utilities',
+]
+dependencies = [
+    'click>=7.0',
+    'requests>=2.25.0',
+]
+
+[project.urls]
+Homepage = "https://github.com/ruarxive/filegetter"
+Repository = "https://github.com/ruarxive/filegetter"
+Changelog = "https://github.com/ruarxive/filegetter/blob/main/CHANGELOG.md"
+Issues = "https://github.com/ruarxive/filegetter/issues"
+
+[project.scripts]
+filegetter = "filegetter.__main__:main"
+
+[tool.setuptools]
+packages = ["filegetter", "filegetter.cmds", "filegetter.storage"]
+
+[tool.setuptools.dynamic]
+version = {attr = "filegetter.__version__"}
+
+[tool.black]
+line-length = 100
+target-version = ['py39', 'py310', 'py311', 'py312', 'py313']
+extend-exclude = '''/(
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/'''
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "--strict-markers",
+    "--tb=short",
+    "--cov=filegetter",
+    "--cov-report=term-missing",
+]
+
+[tool.coverage.run]
+source = ["filegetter"]
+
+[tool.coverage.report]
+precision = 2
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
+
+[tool.mypy]
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
