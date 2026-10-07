@@ -36,6 +36,9 @@ dependencies = [
     'requests>=2.25.0',
 ]
 
+[project.optional-dependencies]
+warc = ['warcio>=1.7.4']
+
 [project.urls]
 Homepage = "https://github.com/ruarxive/filegetter"
 Repository = "https://github.com/ruarxive/filegetter"

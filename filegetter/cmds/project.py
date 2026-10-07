@@ -9,6 +9,7 @@ import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 from zipfile import ZIP_DEFLATED, ZIP_STORED
@@ -17,6 +18,14 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+try:  # optional extra: pip install filegetter[warc]
+    from warcio.statusandheaders import StatusAndHeaders
+    from warcio.warcwriter import WARCWriter
+except ImportError:
+    StatusAndHeaders = None  # type: ignore[assignment,misc]
+    WARCWriter = None  # type: ignore[assignment,misc]
+
+from .. import __version__
 from ..common import get_dict_value, sanitize_filename
 from ..constants import (
     DEFAULT_DELAY,
@@ -27,6 +36,7 @@ from ..constants import (
     DEFAULT_WORKERS,
     FILE_SIZE_DOWNLOAD_LIMIT,
     PROCESSED_FIELDS,
+    WARC_FILENAME,
 )
 from ..storage import FileStorage, FilesystemStorage, ZipFileStorage
 
@@ -185,6 +195,7 @@ class FilegetterBuilder:
         # [storage]
         storagedir = get("storage", "storage_path") or "storage"
         self.compression = get_bool("storage", "compression", True)
+        self.write_warc = get_bool("storage", "write_warc", False)
 
         if (get("files", "use_aria2") or "False").lower() == "true":
             logger.warning(
@@ -222,6 +233,11 @@ class FilegetterBuilder:
             errors.append(
                 "Option [files] file_storage_type must be one of: %s"
                 % ", ".join(FILE_STORAGE_TYPES)
+            )
+        if self.write_warc and WARCWriter is None:
+            errors.append(
+                "Option [storage] write_warc requires the warcio package: "
+                "pip install filegetter[warc]"
             )
 
         if errors:
@@ -342,6 +358,10 @@ class FilegetterBuilder:
                 record["error"] = "HTTP %d" % response.status_code
                 return record, None
 
+            # full header set kept for the WARC record
+            record["http_headers"] = list(response.headers.items())
+            record["reason"] = response.reason or ""
+
             hasher = hashlib.sha256()
             chunks: List[bytes] = []
             size = 0
@@ -416,6 +436,39 @@ class FilegetterBuilder:
             )
         return FilesystemStorage(os.path.join(self.storagedir, "files"))
 
+    def _open_warc(self):
+        """Open (or create) the WARC file and return (file, writer)."""
+        if not self.write_warc:
+            return None, None
+        warc_path = os.path.join(self.storagedir, WARC_FILENAME)
+        is_new = not os.path.exists(warc_path) or os.path.getsize(warc_path) == 0
+        warc_file = open(warc_path, "ab")
+        writer = WARCWriter(warc_file, gzip=True)
+        if is_new:
+            warcinfo = writer.create_warcinfo_record(
+                WARC_FILENAME,
+                {
+                    "software": "filegetter/%s" % __version__,
+                    "format": "WARC file version 1.0",
+                },
+            )
+            writer.write_record(warcinfo)
+        return warc_file, writer
+
+    def _write_warc_record(self, writer, record: Dict[str, Any], content: bytes) -> None:
+        http_headers = StatusAndHeaders(
+            "%s %s" % (record["status"], record.get("reason") or "OK"),
+            list(record.get("http_headers") or []),
+            protocol="HTTP/1.1",
+        )
+        warc_record = writer.create_warc_record(
+            record["url"],
+            "response",
+            payload=BytesIO(content),
+            http_headers=http_headers,
+        )
+        writer.write_record(warc_record)
+
     def run(
         self, dry_run: bool = False, limit: Optional[int] = None, refresh: bool = False
     ) -> Dict[str, int]:
@@ -482,6 +535,7 @@ class FilegetterBuilder:
         list_file = self._open_processed_csv(processed_path)
         writer = csv.writer(list_file, delimiter=",")
         storage = self._build_storage()
+        warc_file, warc_writer = self._open_warc()
         try:
 
             def handle(record: Dict[str, Any], content: Optional[bytes]) -> None:
@@ -491,6 +545,8 @@ class FilegetterBuilder:
                     record["filename"] = filename
                     record["ext"] = ext
                     storage.store(filename, content)
+                    if warc_writer is not None:
+                        self._write_warc_record(warc_writer, record, content)
                     stats["downloaded"] += 1
                     logger.info(
                         "Stored %s (%d bytes, sha256=%s)",
@@ -540,6 +596,9 @@ class FilegetterBuilder:
         finally:
             storage.close()
             list_file.close()
+            if warc_file is not None:
+                warc_file.flush()
+                warc_file.close()
 
         logger.info(
             "Finished: %d total, %d skipped (already downloaded), " "%d downloaded, %d failed",

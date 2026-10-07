@@ -42,6 +42,7 @@ detailed per-file report.
 ✅ **Storage Options** - ZIP archive or filesystem directory tree
 ✅ **Resume Capability** - Already-downloaded files are skipped; failed files are retried
 ✅ **Integrity & Reporting** - CSV report with HTTP status, MIME type, size and SHA-256 checksum
+✅ **WARC Output** - Optional archival WARC/1.0 records (`pip install filegetter[warc]`)
 ✅ **Robust Downloads** - Retries with backoff, timeouts, per-file error isolation
 ✅ **Politeness Controls** - Configurable delay, User-Agent, worker count and file size limit
 ✅ **Zip Compression Toggle** - `compression` option for smaller archives or faster writes
@@ -59,6 +60,9 @@ detailed per-file report.
 ```bash
 pip install --upgrade pip
 pip install --upgrade filegetter
+
+# with WARC output support (see [storage] write_warc below)
+pip install --upgrade filegetter[warc]
 ```
 
 ### Install from Source
@@ -219,6 +223,7 @@ values produce a single error listing every problem found.
 | `storage_path` | No | Directory for storage files, relative to the project (default `storage`) |
 | `compression` | No | `True` (default) compresses the ZIP archive; `False` stores entries uncompressed |
 | `storage_type` | Legacy | Alias for `file_storage_type` used by configs from 1.0.x |
+| `write_warc` | No | If `True`, additionally write every successful response (full HTTP headers + body) to `storage/files.warc.gz` in WARC/1.0 format. Requires the `warc` extra: `pip install filegetter[warc]` |
 
 ### Report Format
 
@@ -251,6 +256,9 @@ values produce a single error listing every problem found.
 4. Files that failed (HTTP errors, connection problems) are recorded with
    their status and retried automatically on the next run; the command exits
    with code 1 whenever anything failed.
+5. With `[storage] write_warc = True` every successful response is also
+   appended to `storage/files.warc.gz` as a WARC record with the complete
+   HTTP headers, preserving full provenance for archival use.
 
 ---
 

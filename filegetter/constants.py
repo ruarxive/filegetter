@@ -10,6 +10,8 @@ DEFAULT_DELAY = 0.0
 DEFAULT_WORKERS = 1
 FILE_SIZE_DOWNLOAD_LIMIT = 270_000_000
 
+WARC_FILENAME = "files.warc.gz"
+
 PROCESSED_FIELDS = [
     "url",
     "filename",
