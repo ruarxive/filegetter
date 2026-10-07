@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   report rows are flushed immediately for crash-safe resume
 - `[storage] compression` option is now honoured (was documented but ignored)
 - Legacy 6-column `processed.csv` reports are upgraded automatically
-- Comprehensive test suite (106 tests, 94% coverage), CI on Python 3.9-3.13
+- Comprehensive test suite (111 tests, 93% coverage), CI on Python 3.9-3.13
 - Optional WARC/1.0 output: `[storage] write_warc = True` appends every
   successful response (full HTTP headers + payload) to
   `storage/files.warc.gz`; requires the `filegetter[warc]` extra

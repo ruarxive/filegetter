@@ -17,6 +17,7 @@ file collection from public data sources.
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Usage](#usage)
+- [Python Library](#python-library)
 - [Configuration Reference](#configuration-reference)
 - [How It Works](#how-it-works)
 - [Examples](#examples)
@@ -174,6 +175,36 @@ filegetter run --refresh
 
 Failures are always recorded in `storage/processed.csv` (with a non-200
 `status`) and retried on the next run.
+
+### Proxies
+
+Downloads go through a standard `requests` session, so the usual proxy
+environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`) are honoured
+automatically.
+
+---
+
+## Python Library
+
+Filegetter can also be used programmatically. `FilegetterBuilder` reads the
+project config and `run()` performs the download cycle, returning a stats
+dict:
+
+```python
+from filegetter.cmds.project import ConfigError, FilegetterBuilder
+
+try:
+    builder = FilegetterBuilder("/path/to/project")
+except ConfigError as e:
+    print("Invalid configuration:", e)
+    raise SystemExit(1)
+
+stats = builder.run()          # same options as the CLI: dry_run=, limit=, refresh=
+print(stats)                   # {'total': 42, 'skipped': 40, 'downloaded': 2, 'failed': 0}
+
+if stats["failed"]:
+    ...                        # failed files are retried on the next run()
+```
 
 ---
 
